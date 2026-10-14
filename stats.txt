@@ -1,0 +1,5 @@
+03.09.2026:
+-O3: Min = 3456    B  │  Avg = 4219.7   B  │  Max = 6776    B
+-O2: Min = 2784    B  │  Avg = 3506.7   B  │  Max = 5960    B
+-O1: Min = 2224    B  │  Avg = 2909.7   B  │  Max = 5236    B  
+-O0: Min = 2948    B  │  Avg = 3787.3   B  │  Max = 6860    B
