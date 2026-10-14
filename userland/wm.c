@@ -3,40 +3,67 @@
 #include "vga_12.h"
 #include "gui_shm.h"
 
-#define MAX_WINDOWS   16
-#define SCREEN_W      640
-#define SCREEN_H      480
-#define ROW_BYTES     (SCREEN_W / 8)
-#define TOTAL_BYTES   (ROW_BYTES * SCREEN_H)
+#define MAX_WINDOWS     16
+#define SCREEN_W        640
+#define SCREEN_H        480
+#define ROW_BYTES       (SCREEN_W / 8)
+#define TOTAL_BYTES     (ROW_BYTES * SCREEN_H)
+
+// SHM-слот 0 — блокировка «WM запущен» (её проверяет gui_create_window)
+#define WM_LOCK_SHMID   0
+// Столько SHM-слотов есть в ядре (MAX_SHM_REGIONS). Окна ищем среди 1..N-1
+#define SHM_SLOT_COUNT  32
+
+// Заголовок окна и клиентская область (сдвиг клиента относительно y окна)
+#define TITLE_H         18
+#define CLIENT_OFFSET_Y 19
+#define CLOSE_BTN_X_OFF 16   // кнопка [X] в правом верхнем углу
+#define CLOSE_BTN_Y_OFF 2
+#define CLOSE_BTN_SIZE  14
 
 // Панель задач (Taskbar)
-#define TASKBAR_H     28
-#define TASKBAR_Y     (SCREEN_H - TASKBAR_H)
-#define START_BTN_X   4
-#define START_BTN_Y   (TASKBAR_Y + 3)
-#define START_BTN_W   68
-#define START_BTN_H   22
+#define TASKBAR_H       28
+#define TASKBAR_Y       (SCREEN_H - TASKBAR_H)
+#define START_BTN_X     4
+#define START_BTN_Y     (TASKBAR_Y + 3)
+#define START_BTN_W     68
+#define START_BTN_H     22
+#define TASK_BTN_X0     (START_BTN_X + START_BTN_W + 6)
+#define TASK_BTN_W      100
+#define TASK_BTN_STEP   104
+#define TRAY_W          76
+#define TRAY_RESERVED   84   // место справа под трей, кнопки окон туда не лезут
 
 // Меню Пуск (Start Menu)
-#define MENU_X        4
-#define MENU_W        184
-#define MENU_ITEM_H   24
-#define MENU_ITEMS    7
-#define MENU_H        (MENU_ITEMS * MENU_ITEM_H + 8)
-#define MENU_Y        (TASKBAR_Y - MENU_H)
+#define MENU_X          4
+#define MENU_W          184
+#define MENU_ITEM_H     24
+#define MENU_ITEMS      7
+#define MENU_H          (MENU_ITEMS * MENU_ITEM_H + 8)
+#define MENU_Y          (TASKBAR_Y - MENU_H)
+#define MENU_ITEMS_Y    (MENU_Y + 4)
 
 // Ярлыки на рабочем столе
-#define DESK_ICON_X   18
-#define DESK_ICON_W   44
-#define DESK_ICON_H   38
-#define DESK_STEP_Y   78
-#define DESK_COUNT    5
+#define DESK_ICON_X     18
+#define DESK_ICON_W     44
+#define DESK_ICON_H     38
+#define DESK_STEP_Y     78
+#define DESK_COUNT      5
 
-// Встроенный fallback-терминал (на случай если /bin/term ещё не собран)
-#define TERM_COLS     46
-#define TERM_ROWS     13
-#define TERM_W        (TERM_COLS * 8 + 8)
-#define TERM_H        (TERM_ROWS * 16 + 8)
+// Приложения, которые запускаются из меню и с рабочего стола (порядок важен)
+#define APP_EXPLORER    0
+#define APP_TERM        1
+#define APP_NOTEPAD     2
+#define APP_CALC        3
+#define APP_SYSMON      4
+#define APP_COUNT       5
+
+// Пункты меню Start: первые APP_COUNT — программы, затем выход и перезагрузка
+#define MENU_EXIT       5
+#define MENU_REBOOT     6
+
+#define TOAST_FRAMES    180  // сообщение внизу экрана (~3 c)
+#define TOAST_MAX       40
 
 typedef struct {
     window_header_t* header;
@@ -44,7 +71,7 @@ typedef struct {
     int32_t          shmid;
 } wm_slot_t;
 
-static wm_slot_t clients[MAX_WINDOWS];
+static wm_slot_t clients[MAX_WINDOWS];   // clients[client_count-1] — верхнее окно
 static int client_count = 0;
 
 static uint8_t* vga_planes[4];
@@ -54,6 +81,47 @@ static uint8_t wm_font[4096];
 static int wm_font_loaded = 0;
 static int start_menu_open = 0;
 static int wm_should_exit = 0;
+
+static int mx = SCREEN_W / 2;
+static int my = SCREEN_H / 2;
+static uint8_t last_btn = 0;
+
+// Перетаскивание окна: храним shmid, а не индекс — индекс меняется при смене z-order
+static int32_t drag_shmid = -1;
+static int drag_dx = 0, drag_dy = 0;
+
+static char toast_text[TOAST_MAX];
+static int  toast_ttl = 0;
+
+static const char* const desktop_app_paths[APP_COUNT] = {
+    "/bin/explorer",
+    "/bin/term",
+    "/bin/notepad",
+    "/bin/calc",
+    "/bin/sysmon"
+};
+
+static const char* const desk_labels[DESK_COUNT] = {
+    "Explorer",
+    "Terminal",
+    "Notepad",
+    "Calc",
+    "SysMon"
+};
+
+static const char* const menu_labels[MENU_ITEMS] = {
+    "Explorer",
+    "Terminal",
+    "Notepad",
+    "Calculator",
+    "System Monitor",
+    "Exit to Shell",
+    "Reboot System"
+};
+
+// ====================================================================
+// ШРИФТ И ВОССТАНОВЛЕНИЕ ТЕКСТОВОГО РЕЖИМА
+// ====================================================================
 
 // Загрузка шрифта /sys/cp437.bm в оперативную память
 static void load_cp437_file(void) {
@@ -73,7 +141,7 @@ static void load_cp437_file(void) {
     }
 }
 
-// Запись шрифта /sys/cp437.bm в VGA Plane 2 при возврате в текстовый режим
+// Запись шрифта в VGA Plane 2 при возврате в текстовый режим
 static void restore_vga_font_cp437(void) {
     load_cp437_file();
     if (!wm_font_loaded) return;
@@ -109,6 +177,10 @@ static void restore_vga_font_cp437(void) {
 
     asm volatile("sti");
 }
+
+// ====================================================================
+// РИСОВАНИЕ
+// ====================================================================
 
 static inline void put_pixel(int x, int y, uint8_t color) {
     if (x < 0 || x >= SCREEN_W || y < 0 || y >= SCREEN_H) return;
@@ -169,6 +241,7 @@ static void draw_text(int x, int y, const char* str, uint8_t color) {
     }
 }
 
+// Строка не длиннее max_chars символов (защита от строк без '\0' в заголовке окна)
 static void draw_text_clipped(int x, int y, const char* str, int max_chars, uint8_t color) {
     if (!str) return;
     int count = 0;
@@ -193,433 +266,6 @@ static void flip_vga(void) {
     }
 }
 
-// ====================================================================
-// ВСТРОЕННЫЙ FALLBACK-ТЕРМИНАЛ (ЕСЛИ /bin/term ОТСУТСТВУЕТ НА ДИСКЕ)
-// ====================================================================
-static int  term_open = 0;
-static int  term_x = 140, term_y = 70;
-static int  term_dragging = 0, term_drag_dx = 0, term_drag_dy = 0;
-static char term_buf[TERM_ROWS][TERM_COLS + 1];
-static int  term_cur_row = 0;
-static int  term_cur_col = 0;
-static char term_cmd[TERM_COLS];
-static int  term_cmd_len = 0;
-
-static void term_clear(void) {
-    for (int r = 0; r < TERM_ROWS; r++) {
-        u_memset(term_buf[r], ' ', TERM_COLS);
-        term_buf[r][TERM_COLS] = '\0';
-    }
-    term_cur_row = 0;
-    term_cur_col = 0;
-}
-
-static void term_scroll(void) {
-    for (int r = 0; r < TERM_ROWS - 1; r++) {
-        u_memcpy(term_buf[r], term_buf[r + 1], TERM_COLS);
-    }
-    u_memset(term_buf[TERM_ROWS - 1], ' ', TERM_COLS);
-    term_cur_row = TERM_ROWS - 1;
-    term_cur_col = 0;
-}
-
-static void term_putc(char c) {
-    if (c == '\r') return;
-    if (c == '\n') {
-        term_cur_col = 0;
-        term_cur_row++;
-        if (term_cur_row >= TERM_ROWS) term_scroll();
-        return;
-    }
-    if (c == '\b') {
-        if (term_cur_col > 0) {
-            term_cur_col--;
-            term_buf[term_cur_row][term_cur_col] = ' ';
-        }
-        return;
-    }
-    if (term_cur_col >= TERM_COLS) {
-        term_cur_col = 0;
-        term_cur_row++;
-        if (term_cur_row >= TERM_ROWS) term_scroll();
-    }
-    term_buf[term_cur_row][term_cur_col++] = c;
-}
-
-static void term_print(const char* s) {
-    if (!s) return;
-    while (*s) term_putc(*s++);
-}
-
-static void term_printn(const char* s) {
-    term_print(s);
-    term_putc('\n');
-}
-
-static void term_prompt(void) {
-    char cwd[64];
-    if (getcwd(cwd, sizeof(cwd)) != 0) u_strncpy(cwd, "/", sizeof(cwd));
-    term_print(getuid() == 0 ? "root@" : "user@");
-    term_print(cwd);
-    term_print("$ ");
-}
-
-static void term_open_builtin(void) {
-    if (!term_open) {
-        term_open = 1;
-        term_clear();
-        term_cmd_len = 0;
-        term_cmd[0] = '\0';
-        term_printn("Photon Desktop Terminal v1.0");
-        term_printn("Commands: help ls cd pwd cat mkdir rm exit");
-        term_prompt();
-    }
-}
-
-static void term_exec_command(char* line) {
-    char* argv[16];
-    int argc = 0;
-    char* p = line;
-
-    while (*p && argc < 15) {
-        while (*p == ' ' || *p == '\t') p++;
-        if (!*p) break;
-        argv[argc++] = p;
-        while (*p && *p != ' ' && *p != '\t') p++;
-        if (*p) *p++ = '\0';
-    }
-    argv[argc] = NULL;
-    if (argc == 0) return;
-
-    const char* cmd = argv[0];
-
-    if (u_strcmp(cmd, "help") == 0) {
-        term_printn("Built-in: help clear ls cd pwd cat echo");
-        term_printn("          mkdir touch rm whoami exit");
-    } else if (u_strcmp(cmd, "clear") == 0 || u_strcmp(cmd, "cls") == 0) {
-        term_clear();
-    } else if (u_strcmp(cmd, "exit") == 0) {
-        term_open = 0;
-        return;
-    } else if (u_strcmp(cmd, "pwd") == 0) {
-        char cwd[64];
-        if (getcwd(cwd, sizeof(cwd)) != 0) u_strncpy(cwd, "/", sizeof(cwd));
-        term_printn(cwd);
-    } else if (u_strcmp(cmd, "whoami") == 0) {
-        term_printn(getuid() == 0 ? "root" : "user");
-    } else if (u_strcmp(cmd, "echo") == 0) {
-        for (int i = 1; i < argc; i++) {
-            if (i > 1) term_putc(' ');
-            term_print(argv[i]);
-        }
-        term_putc('\n');
-    } else if (u_strcmp(cmd, "cd") == 0) {
-        const char* target = (argc > 1) ? argv[1] : "/home";
-        if (chdir(target) < 0) {
-            term_print("cd: not found: ");
-            term_printn(target);
-        }
-    } else if (u_strcmp(cmd, "ls") == 0) {
-        char path[64];
-        if (argc > 1) u_strncpy(path, argv[1], sizeof(path));
-        else if (getcwd(path, sizeof(path)) != 0) u_strncpy(path, "/", sizeof(path));
-
-        int fd = open(path, READ);
-        if (fd < 0) {
-            term_printn("ls: cannot open dir");
-        } else {
-            dirent_t d;
-            uint32_t idx = 0;
-            while (readdir(fd, idx++, &d) == 0) {
-                if (d.name[0] == '\0') break;
-                term_print(d.name);
-                if (d.type == TYPE_DIR) term_putc('/');
-                term_putc(' ');
-            }
-            term_putc('\n');
-            close(fd);
-        }
-    } else if (u_strcmp(cmd, "cat") == 0) {
-        if (argc < 2) {
-            term_printn("usage: cat <file>");
-        } else {
-            int fd = open(argv[1], READ);
-            if (fd < 0) {
-                term_printn("cat: file not found");
-            } else {
-                char buf[65];
-                int n;
-                while ((n = read(fd, buf, 64)) > 0) {
-                    for (int i = 0; i < n; i++) term_putc(buf[i]);
-                }
-                term_putc('\n');
-                close(fd);
-            }
-        }
-    } else if (u_strcmp(cmd, "mkdir") == 0) {
-        if (argc < 2 || mkdir(argv[1]) < 0) term_printn("mkdir failed");
-    } else if (u_strcmp(cmd, "touch") == 0) {
-        if (argc < 2) term_printn("usage: touch <file>");
-        else {
-            int fd = open(argv[1], WRITE | CREATE);
-            if (fd >= 0) close(fd);
-            else term_printn("touch failed");
-        }
-    } else if (u_strcmp(cmd, "rm") == 0) {
-        if (argc < 2 || unlink(argv[1]) < 0) term_printn("rm failed");
-    } else {
-        char exec_path[64];
-        if (cmd[0] == '/') u_strncpy(exec_path, cmd, sizeof(exec_path));
-        else u_path_join(exec_path, "/bin", cmd, sizeof(exec_path));
-
-        stat_t st;
-        if (stat(exec_path, &st) == 0 && st.type == TYPE_FILE) {
-            int is_gui = (u_strcmp(cmd, "calc") == 0 ||
-                          u_strcmp(cmd, "explorer") == 0 ||
-                          u_strcmp(cmd, "notepad") == 0 ||
-                          u_strcmp(cmd, "sysmon") == 0 ||
-                          u_strcmp(cmd, "term") == 0 ||
-                          u_strcmp(cmd, "pc") == 0 ||
-                          u_strcmp(cmd, "pt") == 0);
-            if (is_gui) {
-                int pid = exec(exec_path, argv);
-                if (pid > 0) {
-                    char pbuf[16];
-                    u_format_num((uint32_t)pid, pbuf, sizeof(pbuf));
-                    term_print("Started PID ");
-                    term_printn(pbuf);
-                } else {
-                    term_printn("exec failed");
-                }
-            } else {
-                int32_t out_pipe[2] = {-1, -1};
-                int32_t in_pipe[2]  = {-1, -1};
-                int has_out = (pipe(out_pipe) == 0);
-                int has_in  = (pipe(in_pipe) == 0);
-                if (has_in) {
-                    close(in_pipe[1]);
-                    dup2(in_pipe[0], STDIN);
-                }
-                if (has_out) {
-                    dup2(out_pipe[1], STDOUT);
-                    dup2(out_pipe[1], STDERR);
-                }
-
-                int pid = exec(exec_path, argv);
-
-                if (has_out) {
-                    close(STDOUT);
-                    close(STDERR);
-                    close(out_pipe[1]);
-                }
-                if (has_in) {
-                    close(STDIN);
-                    close(in_pipe[0]);
-                }
-
-                if (pid > 0) {
-                    int status = 0;
-                    waitpid(pid, &status);
-                    if (has_out) {
-                        char rbuf[128];
-                        int in_esc = 0;
-                        while (1) {
-                            int n = read(out_pipe[0], rbuf, sizeof(rbuf));
-                            if (n <= 0) break;
-                            for (int k = 0; k < n; k++) {
-                                char ch = rbuf[k];
-                                if (in_esc) {
-                                    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')) in_esc = 0;
-                                    continue;
-                                }
-                                if (ch == '\033') { in_esc = 1; continue; }
-                                term_putc(ch);
-                            }
-                        }
-                    }
-                } else {
-                    term_printn("exec failed");
-                }
-                if (has_out) close(out_pipe[0]);
-            }
-        } else {
-            term_print("Unknown: ");
-            term_printn(cmd);
-        }
-    }
-}
-
-static void term_handle_key(char key) {
-    if (key == '\r' || key == '\n') {
-        term_putc('\n');
-        term_cmd[term_cmd_len] = '\0';
-        term_exec_command(term_cmd);
-        term_cmd_len = 0;
-        term_cmd[0] = '\0';
-        if (term_open) term_prompt();
-    } else if (key == '\b' || key == 127) {
-        if (term_cmd_len > 0) {
-            term_cmd_len--;
-            term_cmd[term_cmd_len] = '\0';
-            term_putc('\b');
-        }
-    } else if ((unsigned char)key >= 32 && (unsigned char)key <= 126) {
-        if (term_cmd_len < TERM_COLS - 1) {
-            term_cmd[term_cmd_len++] = key;
-            term_cmd[term_cmd_len] = '\0';
-            term_putc(key);
-        }
-    }
-}
-
-static void draw_term_window(void) {
-    if (!term_open) return;
-
-    fill_rect(term_x + 3, term_y + 3, TERM_W, TERM_H + 19, C_DARKGRAY);
-    draw_bevel(term_x - 2, term_y - 2, TERM_W + 4, TERM_H + 23, C_LIGHTGRAY, 0);
-
-    fill_rect(term_x, term_y, TERM_W, 18, C_BLUE);
-    draw_text(term_x + 6, term_y + 1, "Terminal (Built-in)", C_WHITE);
-
-    draw_bevel(term_x + TERM_W - 16, term_y + 2, 14, 14, C_LIGHTRED, 0);
-    draw_char(term_x + TERM_W - 13, term_y + 1, 'X', C_WHITE);
-
-    int sy = term_y + 19;
-    fill_rect(term_x, sy, TERM_W, TERM_H, C_BLACK);
-
-    for (int r = 0; r < TERM_ROWS; r++) {
-        for (int c = 0; c < TERM_COLS; c++) {
-            char ch = term_buf[r][c];
-            if (ch != ' ' && ch != '\0') {
-                draw_char(term_x + 4 + c * 8, sy + 4 + r * 16, (unsigned char)ch, C_LIGHTGREEN);
-            }
-        }
-    }
-
-    int cur_x = term_x + 4 + term_cur_col * 8;
-    int cur_y = sy + 4 + term_cur_row * 16;
-    fill_rect(cur_x, cur_y + 13, 8, 2, C_WHITE);
-}
-
-// ====================================================================
-// ЗАПУСК ПРИЛОЖЕНИЙ РАБОЧЕГО СТОЛА И МЕНЮ START
-// ====================================================================
-static void launch_app(const char* bin_path, int fallback_term) {
-    stat_t st;
-    if (stat(bin_path, &st) == 0 && st.type == TYPE_FILE) {
-        char* argv[2];
-        argv[0] = (char*)bin_path;
-        argv[1] = NULL;
-        exec(bin_path, argv);
-    } else if (fallback_term) {
-        term_open_builtin();
-    }
-}
-
-static void activate_menu_item(int idx) {
-    start_menu_open = 0;
-    switch (idx) {
-        case 0: launch_app("/bin/explorer", 0); break;
-        case 1: launch_app("/bin/term", 1);     break;
-        case 2: launch_app("/bin/notepad", 0);  break;
-        case 3: launch_app("/bin/calc", 0);     break;
-        case 4: launch_app("/bin/sysmon", 0);   break;
-        case 5: wm_should_exit = 1;             break;
-        case 6: reboot();                       break;
-    }
-}
-
-// ====================================================================
-// УПРАВЛЕНИЕ ОКНАМИ (ПОИСК, ФОКУС, Z-ORDER, ОЧИСТКА)
-// ====================================================================
-static void focus_window(int idx) {
-    if (idx < 0 || idx >= client_count) return;
-    if (idx == client_count - 1) return;
-
-    wm_slot_t tmp = clients[idx];
-    for (int i = idx; i < client_count - 1; i++) {
-        clients[i] = clients[i + 1];
-    }
-    clients[client_count - 1] = tmp;
-}
-
-static void cleanup_closed_windows(void) {
-    int i = 0;
-    while (i < client_count) {
-        window_header_t* h = clients[i].header;
-        if (!h || !h->active) {
-            shm_detach(clients[i].shmid);
-            for (int j = i; j < client_count - 1; j++) {
-                clients[j] = clients[j + 1];
-            }
-            client_count--;
-        } else {
-            i++;
-        }
-    }
-}
-
-static void check_new_windows(void) {
-    // 1. Прямое обнаружение новых SHM-окон в памяти (слот 0 зарезервирован под lock самого WM)
-    for (int id = 1; id < 32; id++) {
-        if (client_count >= MAX_WINDOWS) break;
-
-        int already_attached = 0;
-        for (int i = 0; i < client_count; i++) {
-            if (clients[i].shmid == id) {
-                already_attached = 1;
-                break;
-            }
-        }
-        if (already_attached) continue;
-
-        window_header_t* hdr = (window_header_t*)shm_attach(id);
-        if (hdr) {
-            // Если клиент ещё не закончил инициализацию заголовка или окно уже закрыто — отключаемся
-            if (hdr->active != 1 || hdr->closed || hdr->w <= 0 || hdr->h <= 0) {
-                shm_detach(id);
-                continue;
-            }
-            clients[client_count].header = hdr;
-            clients[client_count].pixels = (uint8_t*)(hdr + 1);
-            clients[client_count].shmid = id;
-            client_count++;
-        }
-    }
-}
-
-static void send_key_to_focused_window(char key) {
-    if (term_open) {
-        term_handle_key(key);
-        return;
-    }
-    if (client_count <= 0) return;
-    window_header_t* h = clients[client_count - 1].header;
-    if (!h || !h->active) return;
-
-    uint8_t next = (h->evt_head + 1) % MAX_WIN_EVENTS;
-    if (next != h->evt_tail) {
-        h->events[h->evt_head] = (shm_event_t){
-            .type = EVT_KEY,
-            .x = (int16_t)(unsigned char)key,
-            .y = 0,
-            .btn = (uint8_t)key
-        };
-        h->evt_head = next;
-    }
-}
-
-// ====================================================================
-// ОТРИСОВКА ЯРЛЫКОВ, ПАНЕЛИ ЗАДАЧ, МЕНЮ START И КУРСОРА
-// ====================================================================
-static const char* desk_labels[DESK_COUNT] = {
-    "Explorer",
-    "Terminal",
-    "Notepad",
-    "Calc",
-    "SysMon"
-};
-
 static void draw_desktop_icons(void) {
     for (int i = 0; i < DESK_COUNT; i++) {
         int ix = DESK_ICON_X;
@@ -629,32 +275,32 @@ static void draw_desktop_icons(void) {
         fill_rect(ix + 2, iy + 2, DESK_ICON_W, DESK_ICON_H, C_DARKGRAY);
         draw_bevel(ix, iy, DESK_ICON_W, DESK_ICON_H, C_LIGHTGRAY, 0);
 
-        if (i == 0) {
-            // Explorer: жёлтая папка
+        if (i == APP_EXPLORER) {
+            // Жёлтая папка
             fill_rect(ix + 6, iy + 7, 14, 4, C_BROWN);
             fill_rect(ix + 6, iy + 11, 32, 20, C_YELLOW);
             fill_rect(ix + 6, iy + 11, 32, 2, C_WHITE);
-        } else if (i == 1) {
-            // Terminal: чёрный экран с >_
+        } else if (i == APP_TERM) {
+            // Чёрный экран с >_
             fill_rect(ix + 5, iy + 5, 34, 5, C_BLUE);
             fill_rect(ix + 5, iy + 10, 34, 22, C_BLACK);
             draw_text(ix + 8, iy + 13, ">_", C_LIGHTGREEN);
-        } else if (i == 2) {
-            // Notepad: белый лист с текстом
+        } else if (i == APP_NOTEPAD) {
+            // Белый лист с текстом
             fill_rect(ix + 9, iy + 5, 26, 28, C_WHITE);
             fill_rect(ix + 9, iy + 5, 26, 4, C_BLUE);
             for (int r = 0; r < 4; r++) {
                 fill_rect(ix + 12, iy + 13 + r * 4, 20, 1, C_DARKGRAY);
             }
-        } else if (i == 3) {
-            // Calc: калькулятор с кнопками
+        } else if (i == APP_CALC) {
+            // Калькулятор с кнопками
             fill_rect(ix + 8, iy + 4, 28, 30, C_DARKGRAY);
             fill_rect(ix + 11, iy + 7, 22, 7, C_LIGHTGREEN);
             for (int r = 0; r < 2; r++)
                 for (int c = 0; c < 3; c++)
                     fill_rect(ix + 11 + c * 8, iy + 17 + r * 7, 6, 5, C_WHITE);
-        } else if (i == 4) {
-            // SysMon: график
+        } else if (i == APP_SYSMON) {
+            // График
             fill_rect(ix + 5, iy + 6, 34, 26, C_BLACK);
             fill_rect(ix + 9, iy + 22, 5, 8, C_LIGHTGREEN);
             fill_rect(ix + 17, iy + 15, 5, 15, C_LIGHTGREEN);
@@ -671,6 +317,15 @@ static void draw_desktop_icons(void) {
     }
 }
 
+static int taskbar_button_x(int i) {
+    return TASK_BTN_X0 + i * TASK_BTN_STEP;
+}
+
+// Кнопка окна помещается левее трея
+static int taskbar_button_visible(int i) {
+    return taskbar_button_x(i) + TASK_BTN_STEP <= SCREEN_W - TRAY_RESERVED;
+}
+
 static void draw_taskbar(void) {
     // Основа панели задач
     fill_rect(0, TASKBAR_Y, SCREEN_W, TASKBAR_H, C_LIGHTGRAY);
@@ -679,7 +334,7 @@ static void draw_taskbar(void) {
     // Кнопка [Start]
     draw_bevel(START_BTN_X, START_BTN_Y, START_BTN_W, START_BTN_H, C_LIGHTGRAY, start_menu_open);
 
-    // 4-цветный логотип Windows/Photon внутри кнопки Start
+    // 4-цветный логотип внутри кнопки Start
     int lx = START_BTN_X + 5;
     int ly = START_BTN_Y + 5;
     fill_rect(lx,     ly,     5, 5, C_LIGHTRED);
@@ -688,23 +343,20 @@ static void draw_taskbar(void) {
     fill_rect(lx + 6, ly + 6, 5, 5, C_YELLOW);
     draw_text(START_BTN_X + 20, START_BTN_Y + 3, "Start", C_BLACK);
 
-    // Кнопки открытых окон на панели задач
-    int bx = START_BTN_X + START_BTN_W + 6;
+    // Кнопки открытых окон
     for (int i = 0; i < client_count; i++) {
         window_header_t* h = clients[i].header;
         if (!h || !h->active) continue;
-        if (bx + 104 > SCREEN_W - 84) break;
+        if (!taskbar_button_visible(i)) break;
 
-        int is_top = (i == client_count - 1 && !term_open);
-        draw_bevel(bx, START_BTN_Y, 100, START_BTN_H, C_LIGHTGRAY, is_top);
-        draw_text_clipped(bx + 6, START_BTN_Y + 3, h->title, 11, C_BLACK);
-        bx += 104;
+        int is_top = (i == client_count - 1);
+        draw_bevel(taskbar_button_x(i), START_BTN_Y, TASK_BTN_W, START_BTN_H, C_LIGHTGRAY, is_top);
+        draw_text_clipped(taskbar_button_x(i) + 6, START_BTN_Y + 3, h->title, 11, C_BLACK);
     }
 
-    // Системный трей с часами CMOS справа
-    int tray_w = 76;
-    int tray_x = SCREEN_W - tray_w - 4;
-    draw_bevel(tray_x, START_BTN_Y, tray_w, START_BTN_H, C_LIGHTGRAY, 1);
+    // Трей с часами CMOS
+    int tray_x = SCREEN_W - TRAY_W - 4;
+    draw_bevel(tray_x, START_BTN_Y, TRAY_W, START_BTN_H, C_LIGHTGRAY, 1);
 
     uint8_t hh = 0, mm = 0, ss = 0;
     get_time(&hh, &mm, &ss);
@@ -721,17 +373,19 @@ static void draw_taskbar(void) {
     draw_text(tray_x + 6, START_BTN_Y + 3, time_str, C_BLACK);
 }
 
-static const char* menu_labels[MENU_ITEMS] = {
-    "Explorer",
-    "Terminal",
-    "Notepad",
-    "Calculator",
-    "System Monitor",
-    "Exit to Shell",
-    "Reboot System"
-};
+static void draw_toast(void) {
+    if (toast_ttl <= 0) return;
+    toast_ttl--;
 
-static void draw_start_menu(int mx, int my) {
+    int len = u_strlen(toast_text);
+    int w = len * 8 + 12;
+    int x = START_BTN_X;
+    int y = TASKBAR_Y - 22;
+    fill_rect(x, y, w, 18, C_BLACK);
+    draw_text(x + 6, y + 1, toast_text, C_YELLOW);
+}
+
+static void draw_start_menu(void) {
     if (!start_menu_open) return;
 
     draw_bevel(MENU_X, MENU_Y, MENU_W, MENU_H, C_LIGHTGRAY, 0);
@@ -744,7 +398,7 @@ static void draw_start_menu(int mx, int my) {
     }
 
     for (int i = 0; i < MENU_ITEMS; i++) {
-        int iy = MENU_Y + 4 + i * MENU_ITEM_H;
+        int iy = MENU_ITEMS_Y + i * MENU_ITEM_H;
         int ix = MENU_X + 30;
         int iw = MENU_W - 34;
 
@@ -754,12 +408,12 @@ static void draw_start_menu(int mx, int my) {
         }
 
         // Разделительная линия перед системными пунктами
-        if (i == 5) {
+        if (i == MENU_EXIT) {
             fill_rect(ix + 2, iy - 1, iw - 4, 1, C_DARKGRAY);
         }
 
         // Мини-иконка пункта меню
-        uint8_t icon_col = (i < 5) ? C_YELLOW : C_LIGHTRED;
+        uint8_t icon_col = (i < MENU_EXIT) ? C_YELLOW : C_LIGHTRED;
         fill_rect(ix + 6, iy + 6, 10, 10, icon_col);
         draw_text(ix + 22, iy + 4, menu_labels[i], hovered ? C_WHITE : C_BLACK);
     }
@@ -785,7 +439,7 @@ static const uint8_t cursor_bmp[16][11] = {
     {0,0,0,0,0,1,1,1,0,0,0}
 };
 
-static void draw_cursor(int mx, int my) {
+static void draw_cursor(void) {
     for (int r = 0; r < 16; r++) {
         for (int c = 0; c < 11; c++) {
             uint8_t px = cursor_bmp[r][c];
@@ -795,25 +449,400 @@ static void draw_cursor(int mx, int my) {
     }
 }
 
+static void draw_window(int idx) {
+    window_header_t* h = clients[idx].header;
+    int is_focused = (idx == client_count - 1);
+    uint8_t title_bg = is_focused ? C_BLUE : C_DARKGRAY;
+    uint8_t title_fg = is_focused ? C_WHITE : C_LIGHTGRAY;
+
+    // Тень и 3D-рамка окна
+    fill_rect(h->x + 3, h->y + 3, h->w + 4, h->h + 23, C_DARKGRAY);
+    draw_bevel(h->x - 2, h->y - 2, h->w + 4, h->h + 23, C_LIGHTGRAY, 0);
+
+    // Заголовок и кнопка [X]
+    fill_rect(h->x, h->y, h->w, TITLE_H, title_bg);
+    int max_title = (h->w - 24) / 8;
+    if (max_title > (int)sizeof(h->title) - 1) max_title = sizeof(h->title) - 1;
+    draw_text_clipped(h->x + 5, h->y + 1, h->title, max_title, title_fg);
+    draw_bevel(h->x + h->w - CLOSE_BTN_X_OFF, h->y + CLOSE_BTN_Y_OFF,
+               CLOSE_BTN_SIZE, CLOSE_BTN_SIZE, C_LIGHTRED, 0);
+    draw_char(h->x + h->w - 13, h->y + 1, 'X', C_WHITE);
+
+    // Клиентский холст
+    uint8_t* canvas = clients[idx].pixels;
+    int sy = h->y + CLIENT_OFFSET_Y;
+    for (int cy = 0; cy < h->h; cy++) {
+        for (int cx = 0; cx < h->w; cx++) {
+            put_pixel(h->x + cx, sy + cy, canvas[cy * h->w + cx]);
+        }
+    }
+}
+
+// ====================================================================
+// УПРАВЛЕНИЕ ОКНАМИ
+// ====================================================================
+
+static int is_window_header(const window_header_t* h) {
+    return h->active == 1 && !h->closed &&
+           h->w > 0 && h->w <= SCREEN_W &&
+           h->h > 0 && h->h <= SCREEN_H;
+}
+
+static int find_client_by_shmid(int32_t shmid) {
+    for (int i = 0; i < client_count; i++) {
+        if (clients[i].shmid == shmid) return i;
+    }
+    return -1;
+}
+
+// Отключаем SHM клиента и удаляем его из списка окон
+static void remove_client(int idx) {
+    shm_detach(clients[idx].shmid);
+    for (int j = idx; j < client_count - 1; j++) {
+        clients[j] = clients[j + 1];
+    }
+    client_count--;
+}
+
+// Окно, которое закрыто (active = 0) или закрывается (closed = 1), больше не показываем
+static void cleanup_closed_windows(void) {
+    int i = 0;
+    while (i < client_count) {
+        window_header_t* h = clients[i].header;
+        if (!h || !h->active || h->closed) {
+            remove_client(i);
+        } else {
+            i++;
+        }
+    }
+}
+
+// Ищем новые окна: клиент создаёт SHM-сегмент и выставляет active = 1 последним
+static void discover_windows(void) {
+    for (int32_t id = 1; id < SHM_SLOT_COUNT && client_count < MAX_WINDOWS; id++) {
+        if (find_client_by_shmid(id) >= 0) continue;
+
+        window_header_t* hdr = (window_header_t*)shm_attach(id);
+        if (!hdr) continue;
+
+        // Не окно (или ещё не инициализировано / уже закрыто) — отключаемся
+        if (!is_window_header(hdr)) {
+            shm_detach(id);
+            continue;
+        }
+
+        clients[client_count].header = hdr;
+        clients[client_count].pixels = (uint8_t*)(hdr + 1);
+        clients[client_count].shmid = id;
+        client_count++;
+    }
+}
+
+// Поднимаем окно наверх (z-order) и возвращаем его новый индекс
+static int raise_window(int idx) {
+    if (idx < 0 || idx >= client_count) return -1;
+    if (idx == client_count - 1) return idx;
+
+    wm_slot_t tmp = clients[idx];
+    for (int i = idx; i < client_count - 1; i++) {
+        clients[i] = clients[i + 1];
+    }
+    clients[client_count - 1] = tmp;
+    return client_count - 1;
+}
+
+static void post_event(window_header_t* h, uint8_t type, int x, int y, uint8_t btn) {
+    uint8_t next = (h->evt_head + 1) % MAX_WIN_EVENTS;
+    if (next == h->evt_tail) return;   // очередь клиента переполнена — событие теряем
+
+    h->events[h->evt_head] = (shm_event_t){
+        .type = type,
+        .x = (int16_t)x,
+        .y = (int16_t)y,
+        .btn = btn
+    };
+    h->evt_head = next;
+}
+
+// Верхнее окно под курсором (с учётом заголовка) или -1
+static int window_at(int x, int y) {
+    for (int i = client_count - 1; i >= 0; i--) {
+        window_header_t* h = clients[i].header;
+        if (x >= h->x && x < h->x + h->w &&
+            y >= h->y && y < h->y + CLIENT_OFFSET_Y + h->h) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int point_in_rect(int x, int y, int rx, int ry, int rw, int rh) {
+    return x >= rx && x < rx + rw && y >= ry && y < ry + rh;
+}
+
+// ====================================================================
+// ЗАПУСК ПРОГРАММ
+// ====================================================================
+
+static void set_toast(const char* msg) {
+    u_strncpy(toast_text, msg, sizeof(toast_text));
+    toast_ttl = TOAST_FRAMES;
+}
+
+static void launch_app(const char* path) {
+    stat_t st;
+    if (stat(path, &st) != 0 || st.type != TYPE_FILE) {
+        char msg[TOAST_MAX];
+        snprintf(msg, sizeof(msg), "Not found: %s", path);
+        set_toast(msg);
+        return;
+    }
+
+    char* argv[2];
+    argv[0] = (char*)path;
+    argv[1] = NULL;
+    // Окно программы WM найдёт сам (владелец — header->pid); здесь важен только успех exec
+    if (exec(path, argv) <= 0) {
+        set_toast("Failed to start program");
+    }
+}
+
+static void activate_menu_item(int idx) {
+    start_menu_open = 0;
+    if (idx >= 0 && idx < APP_COUNT) {
+        launch_app(desktop_app_paths[idx]);
+    } else if (idx == MENU_EXIT) {
+        wm_should_exit = 1;
+    } else if (idx == MENU_REBOOT) {
+        reboot();
+    }
+}
+
+// Корректное завершение сессии WM: окна закрываются сами, зависшие программы
+// добиваем, и возвращаем консоль.
+static void shutdown_session(void) {
+    for (int i = 0; i < client_count; i++) {
+        if (clients[i].header) clients[i].header->closed = 1;
+    }
+
+    // Клиенты сами обрабатывают closed (останавливают задания) и вызывают gui_destroy_window
+    for (int t = 0; t < 120; t++) {
+        int alive = 0;
+        for (int i = 0; i < client_count; i++) {
+            if (clients[i].header && clients[i].header->active) alive = 1;
+        }
+        if (!alive) break;
+        sleep(16);
+    }
+
+    // Убиваем только владельцев окон, которые не вышли за отведённое время.
+    // Не трогаем уже завершившиеся pid: ядро при повторном освобождении ресурсов
+    // зомби может сломаться.
+    for (int i = 0; i < client_count; i++) {
+        window_header_t* h = clients[i].header;
+        if (h && h->active && h->pid > 0) send_signal(h->pid, 9);
+    }
+
+    for (int i = 0; i < client_count; i++) {
+        shm_detach(clients[i].shmid);
+    }
+    client_count = 0;
+
+    // Перенаправления ввода-вывода в пайпы, которые могли остаться от программ,
+    // возвращаем на консоль (на нормальных дескрипторах это no-op)
+    close(STDIN);
+    close(STDOUT);
+    close(STDERR);
+}
+
+// ====================================================================
+// ОБРАБОТКА ВВОДА
+// ====================================================================
+
+static void handle_taskbar_click(int x, int y) {
+    for (int i = 0; i < client_count; i++) {
+        if (!taskbar_button_visible(i)) break;
+        window_header_t* h = clients[i].header;
+        if (!h || !h->active) continue;
+        if (point_in_rect(x, y, taskbar_button_x(i), START_BTN_Y, TASK_BTN_W, START_BTN_H)) {
+            raise_window(i);
+            return;
+        }
+    }
+}
+
+static void handle_window_click(int idx, int x, int y) {
+    idx = raise_window(idx);
+    window_header_t* h = clients[idx].header;
+
+    // Кнопка [X]: просим окно закрыться
+    if (point_in_rect(x, y,
+                      h->x + h->w - CLOSE_BTN_X_OFF, h->y + CLOSE_BTN_Y_OFF,
+                      CLOSE_BTN_SIZE, CLOSE_BTN_SIZE)) {
+        h->closed = 1;
+        return;
+    }
+
+    // Захват заголовка — перетаскивание
+    if (y < h->y + TITLE_H) {
+        drag_shmid = clients[idx].shmid;
+        drag_dx = x - h->x;
+        drag_dy = y - h->y;
+        return;
+    }
+
+    // Клик внутри клиентской области
+    int cx = x - h->x;
+    int cy = y - (h->y + CLIENT_OFFSET_Y);
+    if (cx >= 0 && cx < h->w && cy >= 0 && cy < h->h) {
+        post_event(h, EVT_CLICK, cx, cy, 1);
+    }
+}
+
+static void handle_desktop_click(int x, int y) {
+    for (int i = 0; i < APP_COUNT; i++) {
+        int ix = DESK_ICON_X;
+        int iy = 14 + i * DESK_STEP_Y;
+        if (point_in_rect(x, y, ix - 6, iy, DESK_ICON_W + 12, DESK_ICON_H + 20)) {
+            launch_app(desktop_app_paths[i]);
+            return;
+        }
+    }
+}
+
+static void handle_click(int x, int y) {
+    // 1) Кнопка [Start]
+    if (point_in_rect(x, y, START_BTN_X, START_BTN_Y, START_BTN_W, START_BTN_H)) {
+        start_menu_open = !start_menu_open;
+        return;
+    }
+
+    // 2) Открытое меню Start
+    if (start_menu_open) {
+        if (point_in_rect(x, y, MENU_X, MENU_Y, MENU_W, MENU_H)) {
+            if (y >= MENU_ITEMS_Y) {
+                int item = (y - MENU_ITEMS_Y) / MENU_ITEM_H;
+                if (item >= 0 && item < MENU_ITEMS) activate_menu_item(item);
+            }
+            return;
+        }
+        // Клик мимо меню закрывает его
+        start_menu_open = 0;
+    }
+
+    // 3) Панель задач
+    if (y >= TASKBAR_Y) {
+        handle_taskbar_click(x, y);
+        return;
+    }
+
+    // 4) Окна (сверху вниз по z-order)
+    int idx = window_at(x, y);
+    if (idx >= 0) {
+        handle_window_click(idx, x, y);
+        return;
+    }
+
+    // 5) Ярлыки рабочего стола
+    handle_desktop_click(x, y);
+}
+
+static void process_mouse(void) {
+    mouse_state_t ms;
+    if (get_mouse(&ms) != 0) return;
+
+    mx += ms.dx;
+    my -= ms.dy;
+    if (mx < 0) mx = 0;
+    if (mx >= SCREEN_W) mx = SCREEN_W - 1;
+    if (my < 0) my = 0;
+    if (my >= SCREEN_H) my = SCREEN_H - 1;
+
+    int left_down = ms.buttons & 1;
+    int clicked = left_down && !(last_btn & 1);
+    if (clicked) handle_click(mx, my);
+
+    if (!left_down) {
+        drag_shmid = -1;
+    }
+    if (drag_shmid >= 0) {
+        int idx = find_client_by_shmid(drag_shmid);
+        if (idx < 0) {
+            drag_shmid = -1;
+        } else {
+            window_header_t* h = clients[idx].header;
+            int nx = mx - drag_dx;
+            int ny = my - drag_dy;
+            if (ny < 2) ny = 2;
+            if (ny > TASKBAR_Y - 24) ny = TASKBAR_Y - 24;
+            h->x = nx;
+            h->y = ny;
+        }
+    }
+
+    last_btn = ms.buttons;
+}
+
+static void handle_key(char key) {
+    if (key == KEY_WIN) {
+        start_menu_open = !start_menu_open;
+        return;
+    }
+    if (key == 27 && start_menu_open) {
+        start_menu_open = 0;
+        return;
+    }
+
+    if (client_count <= 0) return;
+    window_header_t* h = clients[client_count - 1].header;
+    if (!h || !h->active || h->closed) return;
+    post_event(h, EVT_KEY, (unsigned char)key, 0, (uint8_t)key);
+}
+
+static void process_keyboard(void) {
+    // Забираем все накопившиеся за кадр нажатия
+    char key;
+    while ((key = poll_key()) != 0) {
+        handle_key(key);
+    }
+}
+
+// ====================================================================
+// КОМПОЗИЦИЯ КАДРА
+// ====================================================================
+
+static void compose_frame(void) {
+    clear_desktop(C_CYAN);
+    draw_desktop_icons();
+
+    for (int i = 0; i < client_count; i++) {
+        if (!clients[i].header || !clients[i].header->active) continue;
+        draw_window(i);
+    }
+
+    draw_taskbar();
+    draw_toast();
+    draw_start_menu();
+    draw_cursor();
+    flip_vga();
+}
+
 int main(int argc, char* argv[]) {
     if (getuid() != 0) {
         print("wm: Root permissions required (sudo wm)\n");
         exit(1);
     }
 
-    // Удаляем старый скрытый файл /sys/.wm с диска, если он остался с прошлых запусков
-    unlink("/sys/.wm");
-
-    // Резервируем SHM-сегмент 0 в ОЗУ как индикатор запущенного WM (active = 2)
-    int wm_lock_shmid = shm_create(sizeof(window_header_t));
-    window_header_t* wm_lock_hdr = (wm_lock_shmid >= 0) ? (window_header_t*)shm_attach(wm_lock_shmid) : NULL;
-    if (!wm_lock_hdr || wm_lock_shmid != 0) {
+    // Блокировка «WM запущен»: сегмент с фиксированным слотом 0
+    int32_t lock_id = shm_create(sizeof(window_header_t));
+    window_header_t* lock = (lock_id >= 0) ? (window_header_t*)shm_attach(lock_id) : NULL;
+    if (!lock || lock_id != WM_LOCK_SHMID) {
         print("wm: Already running or SHM slot 0 busy\n");
-        if (wm_lock_hdr) shm_detach(wm_lock_shmid);
+        if (lock) shm_detach(lock_id);   // освобождаем сегмент, который создали зря
         exit(1);
     }
-    wm_lock_hdr->pid = getpid();
-    wm_lock_hdr->active = 2;
+    lock->pid = getpid();
+    lock->active = 2;
 
     for (int p = 0; p < 4; p++) {
         vga_planes[p] = (uint8_t*)malloc(TOTAL_BYTES);
@@ -824,256 +853,33 @@ int main(int argc, char* argv[]) {
     }
 
     load_cp437_file();
-    mkdir(WM_ANNOUNCE_DIR);
     userland_set_mode_640x480();
 
-    int mx = SCREEN_W / 2, my = SCREEN_H / 2;
-    uint8_t last_btn = 0;
-    int drag_idx = -1, drag_dx = 0, drag_dy = 0;
     int frame = 0;
-
     while (!wm_should_exit) {
         if ((frame++ & 7) == 0) {
-            cleanup_closed_windows();
-            check_new_windows();
+            discover_windows();
         }
+        cleanup_closed_windows();
 
-        // 1. Опрос аппаратной мыши
-        mouse_state_t ms;
-        if (get_mouse(&ms) == 0) {
-            mx += ms.dx;
-            my -= ms.dy;
+        process_mouse();
+        process_keyboard();
+        compose_frame();
 
-            if (mx < 0) mx = 0;
-            if (mx >= SCREEN_W) mx = SCREEN_W - 1;
-            if (my < 0) my = 0;
-            if (my >= SCREEN_H) my = SCREEN_H - 1;
-
-            int left_down = ms.buttons & 1;
-            int clicked = left_down && !(last_btn & 1);
-            int handled = 0;
-
-            if (clicked) {
-                // 1) Проверка клика по кнопке [Start]
-                if (mx >= START_BTN_X && mx < START_BTN_X + START_BTN_W &&
-                    my >= START_BTN_Y && my < START_BTN_Y + START_BTN_H) {
-                    start_menu_open = !start_menu_open;
-                    handled = 1;
-                }
-                // 2) Проверка клика по открытому меню Start
-                else if (start_menu_open &&
-                         mx >= MENU_X && mx < MENU_X + MENU_W &&
-                         my >= MENU_Y && my < MENU_Y + MENU_H) {
-                    int rel_y = my - (MENU_Y + 4);
-                    if (rel_y >= 0) {
-                        int item = rel_y / MENU_ITEM_H;
-                        if (item >= 0 && item < MENU_ITEMS) {
-                            activate_menu_item(item);
-                        }
-                    }
-                    handled = 1;
-                }
-                // Любой клик мимо меню закрывает Start Menu
-                else if (start_menu_open) {
-                    start_menu_open = 0;
-                }
-
-                // 3) Клик по кнопкам окон на панели задач
-                if (!handled && my >= TASKBAR_Y) {
-                    int bx = START_BTN_X + START_BTN_W + 6;
-                    for (int i = 0; i < client_count; i++) {
-                        window_header_t* h = clients[i].header;
-                        if (!h || !h->active) continue;
-                        if (mx >= bx && mx < bx + 100 &&
-                            my >= START_BTN_Y && my < START_BTN_Y + START_BTN_H) {
-                            focus_window(i);
-                            handled = 1;
-                            break;
-                        }
-                        bx += 104;
-                    }
-                    handled = 1;
-                }
-
-                // 4) Клик по встроенному терминалу (если он открыт)
-                if (!handled && term_open) {
-                    if (mx >= term_x + TERM_W - 16 && mx <= term_x + TERM_W &&
-                        my >= term_y && my <= term_y + 16) {
-                        term_open = 0;
-                        handled = 1;
-                    } else if (mx >= term_x && mx <= term_x + TERM_W &&
-                               my >= term_y && my <= term_y + 18) {
-                        term_dragging = 1;
-                        term_drag_dx = mx - term_x;
-                        term_drag_dy = my - term_y;
-                        handled = 1;
-                    } else if (mx >= term_x && mx <= term_x + TERM_W &&
-                               my >= term_y && my <= term_y + 19 + TERM_H) {
-                        handled = 1;
-                    }
-                }
-
-                // 5) Клик по SHM-окнам (сверху вниз по Z-order)
-                for (int i = client_count - 1; !handled && i >= 0; i--) {
-                    window_header_t* h = clients[i].header;
-                    if (!h || !h->active) continue;
-
-                    if (mx >= h->x && mx <= h->x + h->w &&
-                        my >= h->y && my <= h->y + 19 + h->h) {
-                        // Поднимаем окно наверх
-                        focus_window(i);
-                        int top_idx = client_count - 1;
-                        h = clients[top_idx].header;
-
-                        // Клик по кнопке [X]
-                        if (mx >= h->x + h->w - 16 && mx <= h->x + h->w &&
-                            my >= h->y && my <= h->y + 16) {
-                            h->closed = 1;
-                        }
-                        // Захват за заголовок окна
-                        else if (my >= h->y && my <= h->y + 18) {
-                            drag_idx = top_idx;
-                            drag_dx = mx - h->x;
-                            drag_dy = my - h->y;
-                        }
-                        // Клик внутри клиентской области
-                        else {
-                            int cx = mx - h->x;
-                            int cy = my - (h->y + 19);
-                            if (cx >= 0 && cx < h->w && cy >= 0 && cy < h->h) {
-                                uint8_t next = (h->evt_head + 1) % MAX_WIN_EVENTS;
-                                if (next != h->evt_tail) {
-                                    h->events[h->evt_head] = (shm_event_t){
-                                        .type = EVT_CLICK,
-                                        .x = (int16_t)cx,
-                                        .y = (int16_t)cy,
-                                        .btn = 1
-                                    };
-                                    h->evt_head = next;
-                                }
-                            }
-                        }
-                        handled = 1;
-                        break;
-                    }
-                }
-
-                // 6) Клик по ярлыкам рабочего стола
-                if (!handled) {
-                    for (int i = 0; i < DESK_COUNT; i++) {
-                        int ix = DESK_ICON_X;
-                        int iy = 14 + i * DESK_STEP_Y;
-                        if (mx >= ix - 6 && mx <= ix + DESK_ICON_W + 6 &&
-                            my >= iy && my <= iy + DESK_ICON_H + 20) {
-                            activate_menu_item(i);
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if (!left_down) {
-                drag_idx = -1;
-                term_dragging = 0;
-            }
-            if (term_dragging) {
-                term_x = mx - term_drag_dx;
-                term_y = my - term_drag_dy;
-                if (term_y < 2) term_y = 2;
-                if (term_y > TASKBAR_Y - 24) term_y = TASKBAR_Y - 24;
-            } else if (drag_idx >= 0 && drag_idx < client_count) {
-                int nx = mx - drag_dx;
-                int ny = my - drag_dy;
-                if (ny < 2) ny = 2;
-                if (ny > TASKBAR_Y - 24) ny = TASKBAR_Y - 24;
-                clients[drag_idx].header->x = nx;
-                clients[drag_idx].header->y = ny;
-            }
-            last_btn = ms.buttons;
-        }
-
-        // 2. Опрос клавиатуры
-        char key = poll_key();
-        if (key != 0) {
-            if (key == KEY_WIN) {
-                // Клавиша Win открывает/закрывает меню Start
-                start_menu_open = !start_menu_open;
-            } else if (key == 27) {
-                // ESC закрывает меню Start или выходит из WM
-                if (start_menu_open) start_menu_open = 0;
-                else break;
-            } else {
-                send_key_to_focused_window(key);
-            }
-        }
-
-        // 3. Композитинг сцены
-        clear_desktop(C_CYAN);
-        draw_desktop_icons();
-
-        // Отрисовка клиентских SHM-окон
-        for (int i = 0; i < client_count; i++) {
-            window_header_t* h = clients[i].header;
-            if (!h || !h->active) continue;
-
-            int is_focused = (i == client_count - 1 && !term_open);
-            uint8_t title_bg = is_focused ? C_BLUE : C_DARKGRAY;
-            uint8_t title_fg = is_focused ? C_WHITE : C_LIGHTGRAY;
-
-            // Тень и 3D-рамка окна
-            fill_rect(h->x + 3, h->y + 3, h->w + 4, h->h + 23, C_DARKGRAY);
-            draw_bevel(h->x - 2, h->y - 2, h->w + 4, h->h + 23, C_LIGHTGRAY, 0);
-
-            // Заголовок и кнопка [X]
-            fill_rect(h->x, h->y, h->w, 18, title_bg);
-            draw_text_clipped(h->x + 5, h->y + 1, h->title, (h->w - 24) / 8, title_fg);
-            draw_bevel(h->x + h->w - 16, h->y + 2, 14, 14, C_LIGHTRED, 0);
-            draw_char(h->x + h->w - 13, h->y + 1, 'X', C_WHITE);
-
-            // Блит пикселей клиентского холста
-            uint8_t* canvas = clients[i].pixels;
-            int sy = h->y + 19;
-            for (int cy = 0; cy < h->h; cy++) {
-                for (int cx = 0; cx < h->w; cx++) {
-                    put_pixel(h->x + cx, sy + cy, canvas[cy * h->w + cx]);
-                }
-            }
-        }
-
-        // Отрисовка встроенного терминала, панели задач, меню Start и курсора
-        draw_term_window();
-        draw_taskbar();
-        draw_start_menu(mx, my);
-        draw_cursor(mx, my);
-
-        flip_vga();
         sleep(16);
     }
 
-    // При выходе закрываем клиентские SHM-сегменты и завершаем все процессы сессии WM
-    int wm_pid = getpid();
-    for (int i = 0; i < client_count; i++) {
-        if (clients[i].header) {
-            clients[i].header->closed = 1;
-            clients[i].header->active = 0;
-        }
-        shm_detach(clients[i].shmid);
-    }
-    client_count = 0;
+    shutdown_session();
 
-    // Освобождаем SHM-сегмент 0 (индикатор запущенного WM)
-    wm_lock_hdr->active = 0;
-    shm_detach(wm_lock_shmid);
+    // Освобождаем блокировку WM
+    lock->active = 0;
+    shm_detach(lock_id);
 
-    // Принудительно останавливаем все процессы, порождённые в течение сессии WM (PID > wm_pid)
-    for (int p = wm_pid + 1; p < wm_pid + 64; p++) {
-        send_signal(p, 9);
-    }
-
-    // Возврат в текстовый режим + запись шрифта /sys/cp437.bm в Plane 2
+    // Возврат в текстовый режим + шрифт /sys/cp437.bm
     userland_set_mode_text();
     restore_vga_font_cp437();
     clear_screen(0x07);
     gotoxy(0, 0);
     exit(0);
+    return 0;
 }
