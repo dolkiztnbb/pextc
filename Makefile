@@ -5,7 +5,7 @@ OBJCOPY   ?= objcopy
 # =========================================================================
 # СПИСОК ПРИЛОЖЕНИЙ
 # Имена файлов без расширения .c (они должны лежать в папке userland/)
-APPS = init pc psh echo edit clear pwd ls cat touch mkdir rm pexdump cp mv sudo	whoami reboot wm explorer term notepad calc sysmon
+APPS = init pc psh echo edit clear pwd ls cat touch mkdir rm pexdump cp mv sudo	whoami reboot wm explorer term pwait notepad calc sysmon
 # ========================================================================= 
 
 PEX_FLAGS_sudo = 0x0004	
@@ -55,8 +55,8 @@ $(BUILD_DIR)/pex_stats: $(SRC_DIR)/pex_stats.c $(HDR_DIR)/pex_header.h
 stats: $(BUILD_DIR)/pex_stats
 	@./$(BUILD_DIR)/pex_stats $(PEX_TARGETS)
 
-# Компиляция общих библиотек (entry.S, photon.c, ulibc.c)
-$(BUILD_DIR)/entry.o: $(USER_DIR)/entry.S
+# Компиляция общих библиотек (entry.s, photon.c, ulibc.c)
+$(BUILD_DIR)/entry.o: $(USER_DIR)/entry.s
 	@mkdir -p $(BUILD_DIR)
 	$(TARGET_CC) $(TARGET_CFLAGS) -c $< -o $@
 

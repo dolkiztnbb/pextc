@@ -36,7 +36,7 @@ static inline void gui_load_font(void) {
 
 static inline gui_window_t* gui_create_window(int w, int h, const char* title) {
     // Проверяем в ОЗУ (через SHM-слот 0), запущен ли сейчас оконный менеджер wm.
-    // В отличие от файла /sys/.wm на диске, SHM-сегмент 0 не остаётся после перезагрузки QEMU!
+    // Файл на диске не используется: после аварийного завершения он остался бы в ФС.
     window_header_t* wm_lock = (window_header_t*)shm_attach(0);
     if (!wm_lock || wm_lock->active != 2) {
         if (wm_lock) shm_detach(0);
@@ -80,7 +80,7 @@ static inline gui_window_t* gui_create_window(int w, int h, const char* title) {
     win->canvas = (uint8_t*)(hdr + 1);
 
     // Барьер памяти: выставляем active = 1 самым последним, когда заголовок полностью готов.
-    // Оконный менеджер обнаруживает сегмент напрямую через таблицу SHM без записи на диск AHCI.
+    // Оконный менеджер находит сегмент перебором SHM-слотов (см. discover_windows в wm.c).
     asm volatile("" ::: "memory");
     hdr->active = 1;
 

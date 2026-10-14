@@ -3,7 +3,6 @@
 
 #include "photon.h"
 
-#define WM_ANNOUNCE_DIR "/sys/wm"
 #define MAX_WIN_EVENTS  16
 
 // Специальные коды клавиш
