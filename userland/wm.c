@@ -438,6 +438,19 @@ static void set_toast(const char* msg) {
     toast_ttl = TOAST_FRAMES;
 }
 
+static int is_windowed_app(const char* path) {
+    const char* base = path;
+    for (const char* p = path; *p; p++) {
+        if (*p == '/') base = p + 1;
+    }
+    return u_strcmp(base, "calc") == 0 ||
+           u_strcmp(base, "explorer") == 0 ||
+           u_strcmp(base, "notepad") == 0 ||
+           u_strcmp(base, "sysmon") == 0 ||
+           u_strcmp(base, "term") == 0 ||
+           u_strcmp(base, "wm") == 0;
+}
+
 static void launch_app(const char* path) {
     stat_t st;
     if (stat(path, &st) != 0 || st.type != TYPE_FILE) {
@@ -447,11 +460,17 @@ static void launch_app(const char* path) {
         return;
     }
 
-    char* argv[2];
-    argv[0] = (char*)path;
-    argv[1] = NULL;
+    // Оконные приложения создают собственный SHM-window. Остальные программы
+    // запускаем внутри term: он перенаправит STDIN/STDOUT/STDERR через пайпы.
+    const int open_in_terminal = !is_windowed_app(path);
+    const char* launch_path = open_in_terminal ? "/bin/term" : path;
+    char* argv[3];
+    argv[0] = (char*)launch_path;
+    argv[1] = open_in_terminal ? (char*)path : NULL;
+    argv[2] = NULL;
+
     // Окно программы WM найдёт сам (владелец — header->pid); здесь важен только успех exec
-    if (exec(path, argv) <= 0) {
+    if (exec(launch_path, argv) <= 0) {
         set_toast("Failed to start program");
     }
 }

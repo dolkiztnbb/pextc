@@ -166,25 +166,33 @@ int main(int argc, char* argv[]) {
 
     print("Photon Shell (psh) v1.0\n");
 
+    int prompt_pending = 1;
     while (1) {
-        if (getcwd(cwd, sizeof(cwd)) != 0) u_strncpy(cwd, "/", 64);
-        
-        int is_root = (getuid() == 0);
-        
-        print(u_getenv("USER"));
-        print("@"); print(cwd);
-        print(" $ ");
+        if (prompt_pending) {
+            if (getcwd(cwd, sizeof(cwd)) != 0) u_strncpy(cwd, "/", 64);
 
-        set_io_color(0x0,0xf,0x0,0x7);
-        int n = read(STDIN, input_buf, sizeof(input_buf) - 1);
-        if (n > 0) {
-            input_buf[n] = '\0';
-            if (n > 0 && (input_buf[n-1] == '\n' || input_buf[n-1] == '\r')) {
-                input_buf[n-1] = '\0';
-            }
-            print("\n");
-            execute_line(input_buf);
+            set_io_color(0x0,0xf,0x0,0x7);
+            print(u_getenv("USER"));
+            print("@"); print(cwd);
+            print(" $ ");
+            prompt_pending = 0;
         }
+
+        int n = read(STDIN, input_buf, sizeof(input_buf) - 1);
+        if (n <= 0) {
+            // В GUI-терминале чтение из пустого пайпа возвращается сразу.
+            // Не повторяем приглашение и уступаем процессор до появления ввода.
+            yield();
+            continue;
+        }
+
+        input_buf[n] = '\0';
+        if (input_buf[n-1] == '\n' || input_buf[n-1] == '\r') {
+            input_buf[n-1] = '\0';
+        }
+        print("\n");
+        execute_line(input_buf);
+        prompt_pending = 1;
     }
     return 0;
 }

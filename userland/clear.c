@@ -1,7 +1,8 @@
 #include "photon.h"
 
 int main(int argc, char* argv[]) {
-    clear_screen(0x07);
-    gotoxy(0, 0);
+    // Стандартная ANSI-команда очистки работает и в текстовой консоли,
+    // и в GUI-терминале, который интерпретирует CSI 2 J и CSI H.
+    print("\033[2J\033[H");
     return 0;
 }
