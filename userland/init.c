@@ -21,6 +21,8 @@ int main(int argc, char* argv[]) { // <--- Меняем void на классич
 
     setuid(1000);
     while(1){
+        // WM can switch VGA modes; always return to a neutral text palette.
+        set_io_color(0x0, 0x7, 0x0, 0x7);
         int pid = exec("/bin/psh", args);
         
         if (pid > 0) {

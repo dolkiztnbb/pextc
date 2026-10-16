@@ -171,9 +171,9 @@ int main(int argc, char* argv[]) {
         
         int is_root = (getuid() == 0);
         
-        print("\033[92m"); print(u_getenv("USER")); 
-        print("\033[97m@\033[96m"); print(cwd);
-        print("\033[97m $ \033[0m");
+        print(u_getenv("USER"));
+        print("@"); print(cwd);
+        print(" $ ");
 
         set_io_color(0x0,0xf,0x0,0x7);
         int n = read(STDIN, input_buf, sizeof(input_buf) - 1);

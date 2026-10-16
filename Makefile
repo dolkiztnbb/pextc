@@ -101,3 +101,9 @@ clean:
 	rm -rf $(BUILD_DIR) $(LCL_TARGETS)
 
 .PHONY: all lcl stats clean
+# WM rendering primitives are isolated from window/input orchestration.
+$(BUILD_DIR)/wm.o: $(USER_DIR)/wm_render.h
+$(BUILD_DIR)/wm_render.o: $(USER_DIR)/wm_render.c $(USER_DIR)/wm_render.h $(USER_DIR)/photon.h $(UHDR_DIR)/ulibc.h
+	@mkdir -p $(BUILD_DIR)
+	$(TARGET_CC) $(TARGET_CFLAGS) -c $< -o $@
+$(BUILD_DIR)/wm.elf: $(BUILD_DIR)/wm_render.o

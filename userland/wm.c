@@ -2,6 +2,7 @@
 #include "ulibc.h"
 #include "vga_12.h"
 #include "gui_shm.h"
+#include "wm_render.h"
 
 #define MAX_WINDOWS     16
 #define SCREEN_W        640
@@ -75,11 +76,13 @@ static wm_slot_t clients[MAX_WINDOWS];   // clients[client_count-1] — верх
 static int client_count = 0;
 
 static uint8_t* vga_planes[4];
-static volatile uint8_t* vram = (volatile uint8_t*)0xA0000;
 
 static uint8_t wm_font[4096];
 static int wm_font_loaded = 0;
 static int start_menu_open = 0;
+static int run_dialog_open = 0;
+static char run_path[96];
+static int run_path_len = 0;
 static int wm_should_exit = 0;
 
 static int mx = SCREEN_W / 2;
@@ -182,140 +185,7 @@ static void restore_vga_font_cp437(void) {
 // РИСОВАНИЕ
 // ====================================================================
 
-static inline void put_pixel(int x, int y, uint8_t color) {
-    if (x < 0 || x >= SCREEN_W || y < 0 || y >= SCREEN_H) return;
-    int idx = y * ROW_BYTES + (x / 8);
-    uint8_t mask = 0x80 >> (x % 8);
-    for (int p = 0; p < 4; p++) {
-        if (color & (1 << p)) vga_planes[p][idx] |= mask;
-        else                  vga_planes[p][idx] &= ~mask;
-    }
-}
 
-static void fill_rect(int x, int y, int w, int h, uint8_t color) {
-    if (x < 0) { w += x; x = 0; }
-    if (y < 0) { h += y; y = 0; }
-    if (x + w > SCREEN_W) w = SCREEN_W - x;
-    if (y + h > SCREEN_H) h = SCREEN_H - y;
-    if (w <= 0 || h <= 0) return;
-
-    for (int cy = y; cy < y + h; cy++)
-        for (int cx = x; cx < x + w; cx++)
-            put_pixel(cx, cy, color);
-}
-
-static void draw_bevel(int x, int y, int w, int h, uint8_t bg, int sunken) {
-    uint8_t tl = sunken ? C_DARKGRAY : C_WHITE;
-    uint8_t br = sunken ? C_WHITE    : C_BLACK;
-    uint8_t in = sunken ? C_BLACK    : C_DARKGRAY;
-
-    fill_rect(x, y, w, h, bg);
-    fill_rect(x, y, w, 1, tl);
-    fill_rect(x, y, 1, h, tl);
-    fill_rect(x, y + h - 1, w, 1, br);
-    fill_rect(x + w - 1, y, 1, h, br);
-    if (!sunken && w > 2 && h > 2) {
-        fill_rect(x + 1, y + h - 2, w - 2, 1, in);
-        fill_rect(x + w - 2, y + 1, 1, h - 2, in);
-    }
-}
-
-static void draw_char(int x, int y, unsigned char ch, uint8_t color) {
-    if (!wm_font_loaded) return;
-    const uint8_t* glyph = &wm_font[ch * 16];
-    for (int row = 0; row < 16; row++) {
-        uint8_t bits = glyph[row];
-        for (int col = 0; col < 8; col++) {
-            if (bits & (0x80 >> col)) {
-                put_pixel(x + col, y + row, color);
-            }
-        }
-    }
-}
-
-static void draw_text(int x, int y, const char* str, uint8_t color) {
-    if (!str) return;
-    while (*str) {
-        draw_char(x, y, (unsigned char)*str++, color);
-        x += 8;
-    }
-}
-
-// Строка не длиннее max_chars символов (защита от строк без '\0' в заголовке окна)
-static void draw_text_clipped(int x, int y, const char* str, int max_chars, uint8_t color) {
-    if (!str) return;
-    int count = 0;
-    while (*str && count < max_chars) {
-        draw_char(x, y, (unsigned char)*str++, color);
-        x += 8;
-        count++;
-    }
-}
-
-static void clear_desktop(uint8_t color) {
-    for (int p = 0; p < 4; p++) {
-        uint8_t mask = (color & (1 << p)) ? 0xFF : 0x00;
-        u_memset(vga_planes[p], mask, TOTAL_BYTES);
-    }
-}
-
-static void flip_vga(void) {
-    for (int p = 0; p < 4; p++) {
-        vga_outw(0x3C4, (uint16_t)((1 << (p + 8)) | 0x02));
-        u_memcpy((void*)vram, vga_planes[p], TOTAL_BYTES);
-    }
-}
-
-static void draw_desktop_icons(void) {
-    for (int i = 0; i < DESK_COUNT; i++) {
-        int ix = DESK_ICON_X;
-        int iy = 14 + i * DESK_STEP_Y;
-
-        // Тень и основа иконки
-        fill_rect(ix + 2, iy + 2, DESK_ICON_W, DESK_ICON_H, C_DARKGRAY);
-        draw_bevel(ix, iy, DESK_ICON_W, DESK_ICON_H, C_LIGHTGRAY, 0);
-
-        if (i == APP_EXPLORER) {
-            // Жёлтая папка
-            fill_rect(ix + 6, iy + 7, 14, 4, C_BROWN);
-            fill_rect(ix + 6, iy + 11, 32, 20, C_YELLOW);
-            fill_rect(ix + 6, iy + 11, 32, 2, C_WHITE);
-        } else if (i == APP_TERM) {
-            // Чёрный экран с >_
-            fill_rect(ix + 5, iy + 5, 34, 5, C_BLUE);
-            fill_rect(ix + 5, iy + 10, 34, 22, C_BLACK);
-            draw_text(ix + 8, iy + 13, ">_", C_LIGHTGREEN);
-        } else if (i == APP_NOTEPAD) {
-            // Белый лист с текстом
-            fill_rect(ix + 9, iy + 5, 26, 28, C_WHITE);
-            fill_rect(ix + 9, iy + 5, 26, 4, C_BLUE);
-            for (int r = 0; r < 4; r++) {
-                fill_rect(ix + 12, iy + 13 + r * 4, 20, 1, C_DARKGRAY);
-            }
-        } else if (i == APP_CALC) {
-            // Калькулятор с кнопками
-            fill_rect(ix + 8, iy + 4, 28, 30, C_DARKGRAY);
-            fill_rect(ix + 11, iy + 7, 22, 7, C_LIGHTGREEN);
-            for (int r = 0; r < 2; r++)
-                for (int c = 0; c < 3; c++)
-                    fill_rect(ix + 11 + c * 8, iy + 17 + r * 7, 6, 5, C_WHITE);
-        } else if (i == APP_SYSMON) {
-            // График
-            fill_rect(ix + 5, iy + 6, 34, 26, C_BLACK);
-            fill_rect(ix + 9, iy + 22, 5, 8, C_LIGHTGREEN);
-            fill_rect(ix + 17, iy + 15, 5, 15, C_LIGHTGREEN);
-            fill_rect(ix + 25, iy + 10, 5, 20, C_YELLOW);
-            fill_rect(ix + 33, iy + 18, 4, 12, C_LIGHTRED);
-        }
-
-        // Подпись под иконкой с тенью
-        int len = u_strlen(desk_labels[i]);
-        int tx = ix + (DESK_ICON_W - len * 8) / 2;
-        int ty = iy + DESK_ICON_H + 4;
-        draw_text(tx + 1, ty + 1, desk_labels[i], C_BLACK);
-        draw_text(tx, ty, desk_labels[i], C_WHITE);
-    }
-}
 
 static int taskbar_button_x(int i) {
     return TASK_BTN_X0 + i * TASK_BTN_STEP;
@@ -327,50 +197,30 @@ static int taskbar_button_visible(int i) {
 }
 
 static void draw_taskbar(void) {
-    // Основа панели задач
-    fill_rect(0, TASKBAR_Y, SCREEN_W, TASKBAR_H, C_LIGHTGRAY);
-    fill_rect(0, TASKBAR_Y, SCREEN_W, 1, C_WHITE);
+    fill_rect(0, TASKBAR_Y, SCREEN_W, TASKBAR_H, C_BLACK);
+    fill_rect(0, TASKBAR_Y, SCREEN_W, 1, C_DARKGRAY);
+    fill_rect(START_BTN_X, START_BTN_Y, START_BTN_W, START_BTN_H, C_BLUE);
+    fill_rect(START_BTN_X, START_BTN_Y, 3, START_BTN_H, C_LIGHTCYAN);
+    draw_text(START_BTN_X + 12, START_BTN_Y + 3, "MENU", C_WHITE);
 
-    // Кнопка [Start]
-    draw_bevel(START_BTN_X, START_BTN_Y, START_BTN_W, START_BTN_H, C_LIGHTGRAY, start_menu_open);
-
-    // 4-цветный логотип внутри кнопки Start
-    int lx = START_BTN_X + 5;
-    int ly = START_BTN_Y + 5;
-    fill_rect(lx,     ly,     5, 5, C_LIGHTRED);
-    fill_rect(lx + 6, ly,     5, 5, C_LIGHTGREEN);
-    fill_rect(lx,     ly + 6, 5, 5, C_LIGHTBLUE);
-    fill_rect(lx + 6, ly + 6, 5, 5, C_YELLOW);
-    draw_text(START_BTN_X + 20, START_BTN_Y + 3, "Start", C_BLACK);
-
-    // Кнопки открытых окон
     for (int i = 0; i < client_count; i++) {
         window_header_t* h = clients[i].header;
-        if (!h || !h->active) continue;
-        if (!taskbar_button_visible(i)) break;
-
-        int is_top = (i == client_count - 1);
-        draw_bevel(taskbar_button_x(i), START_BTN_Y, TASK_BTN_W, START_BTN_H, C_LIGHTGRAY, is_top);
-        draw_text_clipped(taskbar_button_x(i) + 6, START_BTN_Y + 3, h->title, 11, C_BLACK);
+        if (!h || !h->active || !taskbar_button_visible(i)) continue;
+        int x = taskbar_button_x(i);
+        int focused = (i == client_count - 1);
+        fill_rect(x, START_BTN_Y, TASK_BTN_W, START_BTN_H, focused ? C_DARKGRAY : C_BLACK);
+        if (focused) fill_rect(x, START_BTN_Y + TASKBAR_H - 2, TASK_BTN_W, 2, C_LIGHTCYAN);
+        draw_text_clipped(x + 7, START_BTN_Y + 3, h->title, 11, C_WHITE);
     }
 
-    // Трей с часами CMOS
     int tray_x = SCREEN_W - TRAY_W - 4;
-    draw_bevel(tray_x, START_BTN_Y, TRAY_W, START_BTN_H, C_LIGHTGRAY, 1);
-
     uint8_t hh = 0, mm = 0, ss = 0;
     get_time(&hh, &mm, &ss);
     char time_str[9];
-    time_str[0] = '0' + (hh / 10) % 10;
-    time_str[1] = '0' + (hh % 10);
-    time_str[2] = ':';
-    time_str[3] = '0' + (mm / 10) % 10;
-    time_str[4] = '0' + (mm % 10);
-    time_str[5] = ':';
-    time_str[6] = '0' + (ss / 10) % 10;
-    time_str[7] = '0' + (ss % 10);
-    time_str[8] = '\0';
-    draw_text(tray_x + 6, START_BTN_Y + 3, time_str, C_BLACK);
+    time_str[0] = '0' + (hh / 10) % 10; time_str[1] = '0' + hh % 10; time_str[2] = ':';
+    time_str[3] = '0' + (mm / 10) % 10; time_str[4] = '0' + mm % 10; time_str[5] = ':';
+    time_str[6] = '0' + (ss / 10) % 10; time_str[7] = '0' + ss % 10; time_str[8] = '\0';
+    draw_text(tray_x + 6, START_BTN_Y + 3, time_str, C_LIGHTGRAY);
 }
 
 static void draw_toast(void) {
@@ -452,20 +302,19 @@ static void draw_cursor(void) {
 static void draw_window(int idx) {
     window_header_t* h = clients[idx].header;
     int is_focused = (idx == client_count - 1);
-    uint8_t title_bg = is_focused ? C_BLUE : C_DARKGRAY;
+    uint8_t title_bg = is_focused ? C_BLUE : C_BLACK;
     uint8_t title_fg = is_focused ? C_WHITE : C_LIGHTGRAY;
 
     // Тень и 3D-рамка окна
-    fill_rect(h->x + 3, h->y + 3, h->w + 4, h->h + 23, C_DARKGRAY);
-    draw_bevel(h->x - 2, h->y - 2, h->w + 4, h->h + 23, C_LIGHTGRAY, 0);
+    fill_rect(h->x + 3, h->y + 3, h->w + 4, h->h + 23, C_BLACK);
+    fill_rect(h->x - 2, h->y - 2, h->w + 4, h->h + 23, C_DARKGRAY);
 
     // Заголовок и кнопка [X]
     fill_rect(h->x, h->y, h->w, TITLE_H, title_bg);
     int max_title = (h->w - 24) / 8;
     if (max_title > (int)sizeof(h->title) - 1) max_title = sizeof(h->title) - 1;
     draw_text_clipped(h->x + 5, h->y + 1, h->title, max_title, title_fg);
-    draw_bevel(h->x + h->w - CLOSE_BTN_X_OFF, h->y + CLOSE_BTN_Y_OFF,
-               CLOSE_BTN_SIZE, CLOSE_BTN_SIZE, C_LIGHTRED, 0);
+    fill_rect(h->x + h->w - CLOSE_BTN_X_OFF, h->y + CLOSE_BTN_Y_OFF, CLOSE_BTN_SIZE, CLOSE_BTN_SIZE, C_LIGHTRED);
     draw_char(h->x + h->w - 13, h->y + 1, 'X', C_WHITE);
 
     // Клиентский холст
@@ -785,7 +634,27 @@ static void process_mouse(void) {
 
 static void handle_key(char key) {
     if (key == KEY_WIN) {
-        start_menu_open = !start_menu_open;
+        run_dialog_open = 1;
+        start_menu_open = 0;
+        run_path[0] = '\0';
+        run_path_len = 0;
+        return;
+    }
+    if (run_dialog_open) {
+        if (key == 27) { run_dialog_open = 0; return; }
+        if (key == '\r' || key == '\n') {
+            if (run_path_len > 0) launch_app(run_path);
+            run_dialog_open = 0;
+            return;
+        }
+        if (key == '\b') {
+            if (run_path_len > 0) run_path[--run_path_len] = '\0';
+            return;
+        }
+        if (key >= 32 && key < 127 && run_path_len < (int)sizeof(run_path) - 1) {
+            run_path[run_path_len++] = key;
+            run_path[run_path_len] = '\0';
+        }
         return;
     }
     if (key == 27 && start_menu_open) {
@@ -811,9 +680,20 @@ static void process_keyboard(void) {
 // КОМПОЗИЦИЯ КАДРА
 // ====================================================================
 
+static void draw_run_dialog(void) {
+    if (!run_dialog_open) return;
+    int x = 150, y = 190, w = 340, h = 92;
+    fill_rect(x, y, w, h, C_DARKGRAY);
+    fill_rect(x, y, w, 3, C_LIGHTCYAN);
+    draw_text(x + 12, y + 10, "RUN APPLICATION", C_WHITE);
+    draw_text(x + 12, y + 34, "Path:", C_LIGHTGRAY);
+    fill_rect(x + 54, y + 31, w - 68, 20, C_BLACK);
+    draw_text_clipped(x + 58, y + 33, run_path, 30, C_WHITE);
+    draw_text(x + 12, y + 64, "ENTER: launch  |  ESC: close", C_LIGHTGRAY);
+}
+
 static void compose_frame(void) {
-    clear_desktop(C_CYAN);
-    draw_desktop_icons();
+    clear_desktop(C_BLUE);
 
     for (int i = 0; i < client_count; i++) {
         if (!clients[i].header || !clients[i].header->active) continue;
@@ -823,6 +703,7 @@ static void compose_frame(void) {
     draw_taskbar();
     draw_toast();
     draw_start_menu();
+    draw_run_dialog();
     draw_cursor();
     flip_vga();
 }
@@ -853,6 +734,7 @@ int main(int argc, char* argv[]) {
     }
 
     load_cp437_file();
+    wm_renderer_init(vga_planes, wm_font_loaded ? wm_font : NULL);
     userland_set_mode_640x480();
 
     int frame = 0;
@@ -878,6 +760,8 @@ int main(int argc, char* argv[]) {
     // Возврат в текстовый режим + шрифт /sys/cp437.bm
     userland_set_mode_text();
     restore_vga_font_cp437();
+    // Reset the text console's input/output colors after graphics mode.
+    set_io_color(C_BLACK, C_LIGHTGRAY, C_BLACK, C_LIGHTGRAY);
     clear_screen(0x07);
     gotoxy(0, 0);
     exit(0);
